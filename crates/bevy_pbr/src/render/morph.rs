@@ -11,14 +11,14 @@ use bevy_render::render_asset::RenderAssets;
 use bevy_render::render_resource::ShaderType;
 use bevy_render::sync_world::{MainEntity, MainEntityHashMap};
 use bevy_render::{
-    batching::NoAutomaticBatching,
+    batching::{gpu_preprocessing::InstanceInputUniformBuffer, NoAutomaticBatching},
     render_resource::{BufferUsages, RawBufferVec},
     renderer::{RenderDevice, RenderQueue},
     Extract,
 };
 use bytemuck::{NoUninit, Pod, Zeroable};
 
-use crate::{skin, RenderMeshInstances};
+use crate::{skin, MeshInputUniform, RenderMeshInstances};
 
 #[derive(Component)]
 pub struct MorphIndex {
@@ -353,6 +353,14 @@ pub fn prepare_morph_descriptors(
     render_mesh_instances: Res<RenderMeshInstances>,
     meshes: Res<RenderAssets<RenderMesh>>,
     mesh_allocator: Res<MeshAllocator>,
+    mut gpu_inputs: Option<
+        ResMut<
+            bevy_render::batching::gpu_preprocessing::BatchedInstanceBuffers<
+                crate::MeshUniform,
+                MeshInputUniform,
+            >,
+        >,
+    >,
 ) {
     // Don't do anything unless the platform supports storage buffers.
     let (
@@ -414,6 +422,21 @@ pub fn prepare_morph_descriptors(
             }
         };
 
+        // Morph descriptors may become available after the instance was
+        // extracted, or change when an invisible mesh becomes visible again.
+        // Keep the cached GPU input consistent without re-extracting the mesh.
+        if let Some(ref mut gpu_inputs) = gpu_inputs
+            && let RenderMeshInstances::GpuBuilding(ref instances) = *render_mesh_instances
+            && let Some(instance) = instances.get(&morph_target_main_entity)
+        {
+            let index = instance.gpu_specific.current_uniform_index();
+            sync_gpu_morph_descriptor(
+                &mut gpu_inputs.current_input_buffer,
+                index,
+                descriptor_index,
+            );
+        }
+
         // Note where we wrote it.
         gpu_descriptor_indices.insert(morph_target_main_entity, descriptor_index);
     }
@@ -443,5 +466,50 @@ pub fn no_automatic_morph_batching(
 
     for entity in &query {
         commands.entity(entity).try_insert(NoAutomaticBatching);
+    }
+}
+
+// The mesh input can predate its descriptor or outlive an allocation while
+// culled. Updating only the changed index preserves cached instance metadata.
+fn sync_gpu_morph_descriptor(
+    inputs: &mut InstanceInputUniformBuffer<MeshInputUniform>,
+    input_index: u32,
+    descriptor_index: MorphDescriptorIndex,
+) {
+    if let Some(mut input) = inputs.get(input_index)
+        && input.morph_descriptor_index != descriptor_index.0
+    {
+        input.morph_descriptor_index = descriptor_index.0;
+        inputs.set(input_index, input);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_and_reallocated_morph_descriptors_update_cached_input() {
+        let mut inputs = InstanceInputUniformBuffer::new();
+        let input_index = inputs.add(MeshInputUniform {
+            morph_descriptor_index: u32::MAX,
+            current_skin_index: 42,
+            first_vertex_index: 91,
+            ..Default::default()
+        });
+        // A mesh may be extracted before its morph descriptor exists.
+        sync_gpu_morph_descriptor(&mut inputs, input_index, MorphDescriptorIndex(7));
+        assert_eq!(inputs.get(input_index).unwrap().morph_descriptor_index, 7);
+        // Visibility can free that descriptor and allocate another on return.
+        sync_gpu_morph_descriptor(&mut inputs, input_index, MorphDescriptorIndex(3));
+        sync_gpu_morph_descriptor(&mut inputs, input_index, MorphDescriptorIndex(3));
+        let input = inputs.get(input_index).unwrap();
+        assert_eq!(input.morph_descriptor_index, 3);
+        assert_eq!(input.current_skin_index, 42);
+        assert_eq!(input.first_vertex_index, 91);
+        // An instance removed while preparing descriptors needs no update.
+        inputs.remove(input_index);
+        sync_gpu_morph_descriptor(&mut inputs, input_index, MorphDescriptorIndex(8));
+        assert!(inputs.get(input_index).is_none());
     }
 }
