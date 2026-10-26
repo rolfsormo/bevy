@@ -1560,10 +1560,9 @@ mod tests {
 
     use super::ktx2_buffer_to_image;
 
-    #[test]
-    fn test_ktx_levels() {
+    fn mipmapped_texture() -> Vec<u8> {
         // R8UnormSrgb texture with 4x4 pixels data and 3 levels of mipmaps
-        let buffer = vec![
+        vec![
             0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 10, 0x1a, 10, 0x0f, 0, 0, 0, 1,
             0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0,
             0, 0, 0x98, 0, 0, 0, 0x2c, 0, 0, 0, 0xc4, 0, 0, 0, 0x5c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1580,9 +1579,60 @@ mod tests {
             0x2e, 0x33, 0x2e, 0x30, 0x7e, 0x31, 0, 0x4a, 0, 0, 0, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a,
             0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a, 0x4a,
             0x4a,
-        ];
+        ]
+    }
+
+    #[test]
+    fn test_ktx_levels() {
+        let buffer = mipmapped_texture();
         let supported_compressed_formats = CompressedImageFormats::empty();
         let result = ktx2_buffer_to_image(&buffer, supported_compressed_formats, true);
         assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "zstd_c")]
+    #[test]
+    fn zstandard_mip_levels_round_trip_and_reject_corruption() {
+        let original = mipmapped_texture();
+        let reader = ktx2::Reader::new(&original).unwrap();
+        let mut header = reader.header();
+        header.supercompression_scheme = Some(ktx2::SupercompressionScheme::Zstandard);
+        let payload_start = (0..reader.levels().len())
+            .map(|index| {
+                let start = ktx2::Header::LENGTH + index * ktx2::LevelIndex::LENGTH;
+                ktx2::LevelIndex::from_bytes(
+                    original[start..start + ktx2::LevelIndex::LENGTH]
+                        .try_into()
+                        .unwrap(),
+                )
+                .byte_offset as usize
+            })
+            .min()
+            .unwrap();
+        let mut compressed = original[..payload_start].to_vec();
+        compressed[..ktx2::Header::LENGTH].copy_from_slice(&header.as_bytes());
+        for (index, level) in reader.levels().enumerate() {
+            let encoded = zstd::encode_all(level.data, 0).unwrap();
+            let entry = ktx2::LevelIndex {
+                byte_offset: compressed.len() as u64,
+                byte_length: encoded.len() as u64,
+                uncompressed_byte_length: level.data.len() as u64,
+            };
+            let start = ktx2::Header::LENGTH + index * ktx2::LevelIndex::LENGTH;
+            compressed[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&entry.as_bytes());
+            compressed.extend(encoded);
+        }
+        let formats = CompressedImageFormats::empty();
+        let expected = ktx2_buffer_to_image(&original, formats, true).unwrap();
+        let decoded = ktx2_buffer_to_image(&compressed, formats, true).unwrap();
+        assert_eq!(decoded.data, expected.data);
+        assert_eq!(decoded.texture_descriptor, expected.texture_descriptor);
+
+        // Damage the first frame's magic while keeping the KTX2 container valid.
+        compressed[payload_start] ^= 0xff;
+        assert!(matches!(
+            ktx2_buffer_to_image(&compressed, formats, true),
+            Err(crate::TextureError::SuperDecompressionError(_))
+        ));
     }
 }
